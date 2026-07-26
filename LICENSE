@@ -1,3 +1,12 @@
+MIT License
+
+Copyright (c) 2022-2023 Lorenz Schmidt, Nils Werner and contributors,
+International Audio Laboratories Erlangen / Friedrich-Alexander-Universitaet
+Erlangen-Nuernberg -- original torch-pesq implementation, from which this
+project is derived (https://github.com/audiolabs/torch-pesq)
+
+Copyright (c) 2026 LarocheC -- Triton GPU backend and related changes
+
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
 documentation files (the "Software"), to deal in the

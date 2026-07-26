@@ -5,12 +5,18 @@ with open("README.md", encoding="utf-8") as fh:
     long_description = fh.read()
 
 setup(
-    name="torch-pesq",
-    version="0.1.2",
-    description="PyTorch implementation of the Perceptual Evaluation of Speech Quality",
-    author="Lorenz Schmidt",
-    author_email="lorenz.schmidt@audiolabs-erlangen.de",
-    url="https://github.com/audiolabs/torch-pesq",
+    name="triton-pesq",
+    version="0.2.0",
+    description=(
+        "Triton GPU backend for torch-pesq, the PyTorch implementation of the "
+        "Perceptual Evaluation of Speech Quality by Lorenz Schmidt, Nils Werner "
+        "and Nils Peters (International Audio Laboratories Erlangen)"
+    ),
+    author="LarocheC",
+    url="https://github.com/LarocheC/triton-pesq",
+    project_urls={
+        "Original implementation": "https://github.com/audiolabs/torch-pesq",
+    },
     long_description=long_description,
     long_description_content_type="text/markdown",
     license="MIT",

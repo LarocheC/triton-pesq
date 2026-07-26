@@ -3,6 +3,12 @@
 `torch_pesq.PesqLossTriton` is a drop-in replacement for `PesqLoss` in which every
 stage of the PESQ pipeline — forward *and* backward — is a Triton GPU kernel.
 
+The model being evaluated is not this project's work: the PyTorch PESQ
+implementation, its Bark filterbank, loudness model and parameter tables are
+from [audiolabs/torch-pesq](https://github.com/audiolabs/torch-pesq) by Lorenz
+Schmidt, Nils Werner and Nils Peters. This page describes only how that same
+computation is executed on the GPU.
+
 ```python
 import torch
 from torch_pesq import PesqLossTriton

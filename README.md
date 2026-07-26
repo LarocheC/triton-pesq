@@ -1,17 +1,31 @@
-# Loss function inspired by the PESQ score
+# triton-pesq — a Triton GPU backend for the PESQ loss
 
-![Testing badge](https://github.com/audiolabs/torch-pesq/actions/workflows/test.yaml/badge.svg) 
-![Linting badge](https://github.com/audiolabs/torch-pesq/actions/workflows/black.yaml/badge.svg) 
-![Docs badge](https://github.com/audiolabs/torch-pesq/actions/workflows/docs.yaml/badge.svg)
+> **This is a derivative of [audiolabs/torch-pesq](https://github.com/audiolabs/torch-pesq).**
+> The PESQ model, the Bark filterbank, the loudness model and the reference
+> PyTorch implementation are the work of **Lorenz Schmidt, Nils Werner and
+> Nils Peters** at the International Audio Laboratories Erlangen and FAU
+> Erlangen-Nürnberg, published under the MIT license. This project adds a
+> Triton GPU backend on top of it and changes nothing about the model itself.
+> See [Credits](#credits).
 
 Implementation of the widely used Perceptual Evaluation of Speech Quality (PESQ) score as a torch loss function. The PESQ loss alone performs not good for noise suppression, instead combine with scale invariant [SDR](https://arxiv.org/abs/1811.02508). For more information see [1],[2].
 
+`PesqLoss` is the original PyTorch implementation, unchanged. `PesqLossTriton`
+is a drop-in replacement whose every stage, forward and backward, is a Triton
+kernel — 60x faster in the forward pass and up to 181x for forward and backward
+together, while agreeing with the original to ~1e-6.
+
 ## Installation
 
-To install the package just run:
+The import path is deliberately still `torch_pesq`, so this drops into code
+written against the original:
+
 ```bash
-$ pip install torch-pesq
+$ git clone https://github.com/LarocheC/triton-pesq && pip install -e triton-pesq
 ```
+
+The upstream PyTorch-only package remains available as `pip install torch-pesq`.
+Do not install both into the same environment, they provide the same module.
 
 ## Usage
 
@@ -94,6 +108,44 @@ Validation results for fullband noise suppression:
 The baseline system uses L1 time domain loss. Combining the PESQ loss function together with scale invariant [SDR](https://arxiv.org/abs/1811.02508) gives improvement of ~0.1MOS for PESQ and slight improvements in speech distortions, as well as a more stable training progression. Horizontal lines indicate the score of noisy speech.
 
 ![Validation comparison](https://raw.githubusercontent.com/audiolabs/torch-pesq/main/figures/validation.svg)
+
+## Credits
+
+This project would not exist without **[audiolabs/torch-pesq](https://github.com/audiolabs/torch-pesq)**,
+by **Lorenz Schmidt**, **Nils Werner** and **Nils Peters** (International Audio
+Laboratories Erlangen, a joint institution of Friedrich-Alexander-Universität
+Erlangen-Nürnberg and Fraunhofer IIS), with a further contribution from
+**Moreno La Quatra**. It is MIT licensed and the full upstream git history,
+with every original commit and its author, is preserved in this repository.
+
+Everything that makes the score a *score* is theirs: the port of the ITU-T
+P.862 model to PyTorch, the Bark filterbank, the loudness model, the
+disturbance and asymmetry processing, the parameter tables, and the validation
+against the reference implementation. `torch_pesq/bark.py`,
+`torch_pesq/loudness.py` and `torch_pesq/loss.py` are their code, unmodified.
+`torch_pesq/triton_ops/reference.py` is a rearrangement of their `loss.py` into
+per-stage functions, used as the oracle the kernels are tested against.
+
+What this fork adds is `torch_pesq/triton_ops/`: an alternative execution
+backend written in Triton. It changes no model behaviour and is verified
+against the original to ~1e-6 on the loss.
+
+If you use this in academic work, please cite the original authors' paper:
+
+```bibtex
+@article{schmidt2023torchpesq,
+  title   = {Torch PESQ - a PyTorch implementation of the Perceptual
+             Evaluation of Speech Quality},
+  author  = {Schmidt, Lorenz and Werner, Nils and Peters, Nils},
+  year    = {2023},
+  note    = {International Audio Laboratories Erlangen},
+  url     = {https://github.com/audiolabs/torch-pesq}
+}
+```
+
+The PESQ algorithm itself is ITU-T Recommendation P.862 [3][4]; this is an
+independent implementation of it and is not endorsed by or affiliated with the
+ITU, the International Audio Laboratories Erlangen, or the original authors.
 
 ## Relevant references
 1. [End-to-End Multi-Task Denoising for joint SDR and PESQ Optimization](https://arxiv.org/abs/1901.09146)
