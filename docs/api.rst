@@ -32,3 +32,19 @@ torch\_pesq.loudness module
    :members:
    :undoc-members:
    :show-inheritance:
+
+torch\_pesq.triton\_ops.loss module
+-----------------------------------
+
+.. automodule:: torch_pesq.triton_ops.loss
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+torch\_pesq.triton\_ops.reference module
+----------------------------------------
+
+.. automodule:: torch_pesq.triton_ops.reference
+   :members:
+   :undoc-members:
+   :show-inheritance:

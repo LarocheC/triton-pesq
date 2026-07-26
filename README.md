@@ -30,6 +30,52 @@ print(mos, loss)
 loss.backward()
 ```
 
+## Triton backend
+
+`PesqLossTriton` is a drop-in replacement in which every stage of the pipeline,
+forward and backward, is a Triton GPU kernel:
+
+```python
+from torch_pesq import PesqLossTriton
+
+pesq = PesqLossTriton(0.5, sample_rate=16000).cuda()
+loss = pesq(reference, degraded)   # float32 CUDA tensors
+loss.sum().backward()
+```
+
+Measured on a GTX 1080 Ti with 16 kHz input, synchronised wall clock, median of
+15 runs (`python benchmarks/bench_triton.py`):
+
+| batch | audio | PyTorch | Triton | speedup | Triton + CUDA graph | speedup |
+|------:|------:|--------:|-------:|--------:|--------------------:|--------:|
+| **forward** | | | | | | |
+| 1 | 1 s | 41.6 ms | 0.688 ms | **60x** | | |
+| 8 | 8 s | 43.9 ms | 0.714 ms | **62x** | | |
+| **forward + backward** | | | | | | |
+| 1 | 1 s | 84.1 ms | 5.83 ms | 14x | 0.465 ms | **181x** |
+| 8 | 8 s | 87.3 ms | 6.03 ms | 14x | 0.868 ms | **101x** |
+
+Almost all of the PyTorch time is `torchaudio.functional.lfilter`, which has no
+CUDA kernel and falls back to a Python loop over time samples; the Triton
+backend replaces it with a chunked parallel scan. After that the pipeline is so
+fast that it becomes bound by the host side cost of launching its ~40 small
+kernels, which is why replaying it from a CUDA graph is worth another 7x on the
+training path:
+
+```python
+step = pesq.graphed(reference, degraded)   # fixes the input shape
+loss = step(reference, degraded)           # bit exact with the eager call
+```
+
+The loss agrees with the PyTorch implementation to ~1e-6 relative. It is in fact
+the *more* accurate of the two: measured against a float64 evaluation of the
+same pipeline it is ~17x closer, because torchaudio's float32 direct-form-I
+recursion is poorly conditioned for the order 10 level alignment filter.
+
+See [docs/triton.md](docs/triton.md) for the design, `benchmarks/bench_triton.py`
+for the numbers above and `benchmarks/validate_triton.py` for a comparison of
+both backends against the ITU-T P.862 reference.
+
 ## Comparison to reference implementation
 
 The following figures uses samples from the VCTK [1] speech and DEMAND [2] noise dataset with varying mixing factors. They illustrate correlation and maximum error between the reference and torch implementation:
