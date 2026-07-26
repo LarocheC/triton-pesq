@@ -24,11 +24,13 @@ meaningful scale for a filter output; a per-element relative error is
 meaningless where the reference crosses zero.
 """
 
+import math
+
 import numpy as np
 import pytest
 import torch
 
-from scipy.signal import butter
+from scipy.signal import butter, cheby1, ellip
 from torchaudio.functional import lfilter
 
 from torch_pesq.triton_ops._common import HAS_TRITON
@@ -116,6 +118,14 @@ def check_accuracy(mine, oracle, exact, what=""):
 
     ours, theirs = peak_error(mine, exact), peak_error(oracle, exact)
 
+    # the float32 oracle does not merely lose digits on a high order bandpass,
+    # it returns `NaN` outright -- `butter(8, [325, 3250])` does.  `max(nan, x)`
+    # is `nan` in Python, which would turn the strongest possible win into a
+    # failed comparison, so score a broken oracle as infinitely bad.
+    if not math.isfinite(theirs):
+        theirs = math.inf
+
+    assert math.isfinite(ours), f"{what}: the module itself returned {ours}"
     assert ours < TOL, f"{what}: {ours} >= {TOL}"
     assert ours <= max(theirs, FLOOR), (
         f"{what}: {ours} is worse than the float32 oracle ({theirs}) and worse "
@@ -806,3 +816,444 @@ def test_degraded_filter_warns():
 
     with pytest.warns(RuntimeWarning, match="degraded"):
         TritonIIR(numerator, denominator, chunk_size=128)
+
+
+# ---------------------------------------------------------------------------
+# adversarial review: launch geometry, basis selection and coverage holes
+# ---------------------------------------------------------------------------
+
+
+def test_batch_beyond_the_grid_y_limit():
+    """A batch larger than 65535 must not hit the CUDA ``gridDim.y`` cap.
+
+    CUDA caps the second and third grid dimensions at 65535 while the first one
+    goes to ``2**31 - 1``.  Putting the batch on ``tl.program_id(1)`` therefore
+    fails the *launch* -- not a wrong answer, an ``invalid configuration
+    argument`` -- for any batch beyond that, which ``_MAX_ELEMENTS`` happily
+    allows: 70000 rows of 64 samples are only 4.5M elements and 18MB.
+    """
+
+    numerator, denominator = FILTERS["order2"]
+    module = TritonIIR(numerator, denominator, chunk_size=64).cuda()
+
+    signal = noise(70000, 64, seed=101)
+    out = module(signal)
+
+    torch.cuda.synchronize()
+    assert torch.isfinite(out).all()
+
+    # the rows past 65535 are exactly the ones a y-grid launch cannot reach, so
+    # check them against the float64 oracle rather than the batch as a whole
+    tail = signal[-200:].contiguous()
+    assert peak_error(out[-200:], reference(tail, numerator, denominator)) < TOL
+
+    # and every remaining row has to be filtered, not left at whatever the
+    # caching allocator had in the buffer
+    assert (out.abs().amax(dim=1) > 0).all()
+
+
+def test_many_chunks_on_a_single_row():
+    """A long signal puts many chunk tiles on the first grid axis."""
+
+    numerator, denominator = FILTERS["order10"]
+    module = TritonIIR(numerator, denominator, chunk_size=64).cuda()
+
+    # 480000 samples at chunk 64 is 7500 chunks, i.e. 7500/BLOCK_C * TAPS/BLOCK_T
+    # output programs per row -- the axis the batch now shares
+    signal = noise(2, 480000, seed=102)
+    out = module(signal)
+
+    assert torch.isfinite(out).all()
+    assert peak_error(out, reference(signal, numerator, denominator)) < TOL
+
+
+def test_state_buffer_offsets_are_checked_too(modules, monkeypatch):
+    """The int32 guard has to cover the state buffer, not only the signal.
+
+    The state offset is ``(batch * nchunk + chunk) * padded``, which exceeds
+    ``batch * sample`` whenever the padded state is wider than a chunk holds
+    samples.  A guard that only looks at the signal would let the state offset
+    wrap while reporting the shape as fine.
+    """
+
+    module = modules[("order2", "matmul", 64)]
+    padded = module.padded
+
+    nbatch, ntime = 4, 8  # one chunk of 64 taps, mostly masked
+    signal_elements = nbatch * ntime
+    state_elements = nbatch * 1 * padded
+
+    assert state_elements > signal_elements, (state_elements, signal_elements)
+
+    # a limit between the two: the signal fits, the state buffer does not
+    monkeypatch.setattr(
+        iir_module, "_MAX_ELEMENTS", (signal_elements + state_elements) // 2
+    )
+
+    with pytest.raises(RuntimeError, match="int32"):
+        module(torch.zeros(nbatch, ntime, device="cuda"))
+
+
+@pytest.mark.parametrize("order", [1, 2, 3, 4, 5, 6, 7, 9, 12, 16])
+def test_filter_order_sweep(order):
+    """Every order between 1 and 16, not only the two PESQ filters.
+
+    Orders other than 2 and 10 exercise odd state counts (the cascade pads to
+    an even number), a one dimensional state and, at order 16, the case where
+    picking the realisation by conditioning alone used to select the modal
+    basis and lose four digits.
+    """
+
+    if order == 1:
+        numerator, denominator = (np.asarray(c) for c in butter(1, 3000, fs=16000))
+    elif order % 2:
+        numerator, denominator = (
+            np.asarray(c) for c in butter(order, 3000, fs=16000, btype="low")
+        )
+    else:
+        numerator, denominator = (
+            np.asarray(c)
+            for c in butter(order // 2, [325, 3250], fs=16000, btype="band")
+        )
+
+    module = TritonIIR(numerator, denominator, chunk_size=256).cuda()
+    assert module.order == order
+
+    signal = noise(2, 16000, seed=200 + order)
+    upstream = noise(2, 16000, seed=300 + order)
+
+    exact = reference(signal, numerator, denominator)
+    oracle = reference(signal, numerator, denominator, dtype=torch.float32)
+    check_accuracy(module(signal), oracle, exact, f"order{order} forward")
+
+    leaf = signal.clone().requires_grad_(True)
+    mine = torch.autograd.grad(module(leaf), leaf, upstream)[0]
+
+    exact_in = signal.double().cpu().requires_grad_(True)
+    exact_grad = torch.autograd.grad(
+        reference(exact_in, numerator, denominator), exact_in, upstream.double().cpu()
+    )[0]
+
+    assert peak_error(mine, exact_grad) < TOL, f"order{order} backward"
+
+
+def test_order_sixteen_picks_the_accurate_realisation():
+    """Conditioning alone is the wrong criterion, fidelity has to count too.
+
+    For ``butter(8, [325, 3250])`` the modal realisation has the smaller table
+    entries (66 against 81) but its float64 impulse response is already off by
+    ``2.3e-05``, against ``8.0e-08`` for the cascade.  Selecting on the table
+    size alone therefore shipped a filter with a peak relative error of
+    ``5.1e-05``, five times outside :data:`TOL`, on a filter for which
+    ``4.9e-07`` was available.
+    """
+
+    numerator, denominator = (
+        np.asarray(c) for c in butter(8, [325, 3250], fs=16000, btype="band")
+    )
+    module = TritonIIR(numerator, denominator, chunk_size=256).cuda()
+
+    assert module.states == 16
+    assert module.basis == "cascade"
+
+    signal = noise(2, 16000, seed=113)
+    error = peak_error(module(signal), reference(signal, numerator, denominator))
+
+    assert error < 2e-6, error
+
+
+@pytest.mark.parametrize(
+    "name,coeffs",
+    [
+        ("bp12", lambda: butter(6, [325, 3250], fs=16000, btype="band")),
+        ("bp14", lambda: butter(7, [325, 3250], fs=16000, btype="band")),
+        ("cheby1", lambda: cheby1(4, 1, [325, 3250], fs=16000, btype="band")),
+        ("ellip", lambda: ellip(4, 1, 60, [325, 3250], fs=16000, btype="band")),
+        ("cheby1_hi", lambda: cheby1(6, 1, [325, 3250], fs=16000, btype="band")),
+    ],
+)
+def test_other_filter_families(name, coeffs):
+    """Chebyshev and elliptic responses, whose poles sit closer to the circle."""
+
+    numerator, denominator = (np.asarray(c) for c in coeffs())
+    module = TritonIIR(numerator, denominator, chunk_size=256).cuda()
+
+    signal = noise(2, 16000, seed=hash(name) % 997)
+    exact = reference(signal, numerator, denominator)
+    oracle = reference(signal, numerator, denominator, dtype=torch.float32)
+
+    check_accuracy(module(signal), oracle, exact, name)
+
+
+@pytest.mark.parametrize("radius", [0.99, 0.999, 0.9999])
+@pytest.mark.parametrize("samples", [16000, 300000])
+def test_poles_close_to_the_unit_circle(radius, samples):
+    """A resonator with a very long ring down, over a very long signal.
+
+    This is the regime in which the inter chunk scan accumulates: the carry
+    recursion runs ``samples / chunk`` steps and a pole at ``0.9999`` decays by
+    less than 3% over a 256 sample chunk, so nothing damps the round off.  The
+    tolerance is the usual one; ``1e-5`` is only left behind beyond a radius of
+    ``0.99999``, which is documented in the module docstring.
+    """
+
+    denominator = np.array([1.0, -2 * radius * np.cos(0.3), radius * radius])
+    numerator = np.array([1.0, 0.0, 0.0])
+
+    module = TritonIIR(numerator, denominator, chunk_size=256).cuda()
+
+    signal = noise(2, samples, seed=int(radius * 1e4) + samples)
+    exact = reference(signal, numerator, denominator)
+    oracle = reference(signal, numerator, denominator, dtype=torch.float32)
+
+    check_accuracy(module(signal), oracle, exact, f"r={radius} n={samples}")
+
+
+def test_extreme_pole_is_documented_not_silent():
+    """At a radius of ``0.99999`` accuracy degrades -- but stays ahead of the
+    oracle by more than an order of magnitude, and never turns into ``NaN``."""
+
+    radius = 0.99999
+    denominator = np.array([1.0, -2 * radius * np.cos(0.3), radius * radius])
+    numerator = np.array([1.0, 0.0, 0.0])
+
+    module = TritonIIR(numerator, denominator, chunk_size=256).cuda()
+
+    signal = noise(2, 480000, seed=131)
+    exact = reference(signal, numerator, denominator)
+    oracle = reference(signal, numerator, denominator, dtype=torch.float32)
+
+    out = module(signal)
+    assert torch.isfinite(out).all()
+
+    ours, theirs = peak_error(out, exact), peak_error(oracle, exact)
+
+    # measured 4.4e-05 against 1.2e-03; the loose bound is the documented
+    # limitation of this regime, the ratio is the actual assertion
+    assert ours < 1e-4, ours
+    assert ours < theirs / 10.0, (ours, theirs)
+
+
+@pytest.mark.parametrize("exponent", [-30, -35, -38])
+def test_denormal_scale_inputs(exponent):
+    """Inputs near the float32 denormal floor stay finite and stay linear.
+
+    Down to ``1e-38`` the state of the cascade is still normal and the filter
+    keeps five digits.  Below that the *state*, which the section gains scale
+    down further, underflows before the signal does -- see the module
+    docstring; the assertion here is only that nothing turns into ``NaN`` and
+    that the result is the scaled version of the well scaled answer.
+    """
+
+    numerator, denominator = FILTERS["order10"]
+    module = TritonIIR(numerator, denominator, chunk_size=128).cuda()
+
+    unit = noise(2, 2000, seed=141)
+    scale = float(10.0**exponent)
+
+    small = module(unit * scale)
+    assert torch.isfinite(small).all()
+
+    exact = reference(unit * scale, numerator, denominator)
+    tolerance = TOL if exponent >= -35 else 1e-5 * 10.0 ** (-35 - exponent)
+
+    assert peak_error(small, exact) < tolerance, peak_error(small, exact)
+
+
+def test_subnormal_input_does_not_produce_nan():
+    """True subnormals lose precision but must not poison the output."""
+
+    numerator, denominator = FILTERS["order10"]
+    module = TritonIIR(numerator, denominator, chunk_size=128).cuda()
+
+    signal = noise(2, 2000, seed=142) * 1e-42
+    out = module(signal)
+
+    assert torch.isfinite(out).all()
+    assert not torch.isnan(out).any()
+
+
+@pytest.mark.parametrize("taps", [64, 128, 256, 512])
+@pytest.mark.parametrize("method", ["matmul", "scan"])
+def test_backward_at_every_chunk_size(taps, method):
+    """Gradients, not just forwards, at every chunk length and both methods.
+
+    The shipped ``chunk_size`` is 256 and ``"tune"`` reaches 512, but only the
+    forward pass was covered there; the reverse index flip interacts with the
+    partial last chunk differently from the forward one.
+    """
+
+    numerator, denominator = FILTERS["order10"]
+    module = TritonIIR(numerator, denominator, chunk_size=taps, method=method).cuda()
+
+    # 3001 is not a multiple of 64, 128, 256 or 512
+    signal = noise(2, 3001, seed=taps + 400, scale=3000.0)
+    upstream = noise(2, 3001, seed=taps + 401)
+
+    leaf = signal.clone().requires_grad_(True)
+    mine = torch.autograd.grad(module(leaf), leaf, upstream)[0]
+
+    exact_in = signal.double().cpu().requires_grad_(True)
+    exact = torch.autograd.grad(
+        reference(exact_in, numerator, denominator), exact_in, upstream.double().cpu()
+    )[0]
+
+    oracle_in = signal.clone().requires_grad_(True)
+    oracle = torch.autograd.grad(
+        reference(oracle_in, numerator, denominator, dtype=torch.float32),
+        oracle_in,
+        upstream,
+    )[0]
+
+    check_accuracy(mine, oracle, exact, f"{method}/{taps} backward")
+
+    # a filter gradient is dense; a silently zeroed head or tail would survive
+    # a peak relative check on a lucky cotangent
+    assert (mine != 0).float().mean().item() > 0.99
+
+
+@pytest.mark.parametrize("taps", [64, 128, 256, 512])
+def test_batch_one_at_every_chunk_size(taps):
+    """Batch one, both methods, a length that is not a multiple of the chunk."""
+
+    numerator, denominator = FILTERS["order10"]
+
+    for method in ("matmul", "scan"):
+        module = TritonIIR(
+            numerator, denominator, chunk_size=taps, method=method
+        ).cuda()
+
+        signal = noise(1, taps * 3 + 7, seed=taps)
+        exact = reference(signal, numerator, denominator)
+
+        assert peak_error(module(signal), exact) < TOL, f"{method}/{taps}"
+
+
+def test_non_contiguous_backward_for_both_methods(modules):
+    """A strided input through the scan formulation too, not just the matmul."""
+
+    numerator, denominator = FILTERS["order10"]
+
+    for method in ("matmul", "scan"):
+        module = modules[("order10", method, 128)]
+
+        leaf = noise(4, 3000, seed=151).requires_grad_(True)
+        strided = leaf[::2, 1::2]
+        assert not strided.is_contiguous()
+
+        upstream = noise(*strided.shape, seed=152)
+        mine = torch.autograd.grad(module(strided), leaf, upstream, retain_graph=False)[
+            0
+        ]
+
+        exact_leaf = leaf.detach().double().cpu().requires_grad_(True)
+        exact = torch.autograd.grad(
+            reference(exact_leaf[::2, 1::2].contiguous(), numerator, denominator),
+            exact_leaf,
+            upstream.double().cpu(),
+        )[0]
+
+        assert peak_error(mine, exact) < TOL, method
+        assert torch.equal(mine[1::2], torch.zeros_like(mine[1::2]))
+
+
+def test_tolerance_is_not_vacuous(modules):
+    """:data:`TOL` has to be a real bound, so record the margin it actually has.
+
+    A tolerance that no realistic input comes near is not a test.  Over the
+    shapes and filters this suite uses the module stays below ``1e-6``, so
+    ``TOL = 1e-5`` is a ten fold margin -- tight enough to catch a regression
+    of a single float32 digit.
+    """
+
+    worst = 0.0
+    for name in FILTERS:
+        numerator, denominator = FILTERS[name]
+        for method in ("matmul", "scan"):
+            module = modules[(name, method, 128)]
+            for batch, samples in ((1, 16000), (5, 4097)):
+                signal = noise(batch, samples, seed=batch + samples)
+                worst = max(
+                    worst,
+                    peak_error(
+                        module(signal), reference(signal, numerator, denominator)
+                    ),
+                )
+
+    assert 0.0 < worst < TOL / 5.0, f"worst {worst}, TOL {TOL}"
+
+
+def test_scan_and_matmul_agree_bitwise_in_kind(modules):
+    """The two formulations are the same filter, only summed differently."""
+
+    numerator, denominator = FILTERS["order10"]
+
+    signal = noise(3, 2049, seed=161)
+    exact = reference(signal, numerator, denominator)
+
+    matmul = modules[("order10", "matmul", 128)](signal)
+    scan = modules[("order10", "scan", 128)](signal)
+
+    assert peak_error(matmul, exact) < TOL
+    assert peak_error(scan, exact) < TOL
+    assert peak_error(matmul, scan.double().cpu()) < FLOOR
+
+
+def test_zero_batch_backward(modules):
+    """An empty batch has to survive the launch in both directions."""
+
+    module = modules[("order10", "matmul", 128)]
+
+    leaf = torch.zeros(0, 1000, device="cuda", requires_grad=True)
+    out = module(leaf)
+    assert out.shape == (0, 1000)
+
+    grad = torch.autograd.grad(out, leaf, torch.zeros_like(out))[0]
+    assert grad.shape == (0, 1000)
+
+
+def test_scan_output_is_fully_written():
+    """The scan formulation gets the same uninitialised memory check."""
+
+    numerator, denominator = FILTERS["order10"]
+    module = TritonIIR(numerator, denominator, chunk_size=128, method="scan").cuda()
+
+    signal = noise(3, 4001, seed=171)
+    expected = module(signal).clone()
+
+    torch.cuda.synchronize()
+    poison = [torch.full_like(signal, float("nan")) for _ in range(8)]
+    del poison
+
+    again = module(signal)
+    assert torch.isfinite(again).all()
+    assert torch.equal(again, expected)
+
+
+def test_only_triton_kernels_touch_the_data_scan(modules):
+    """The scan formulation must also stay entirely inside Triton."""
+
+    module = modules[("order10", "scan", 128)]
+
+    signal = noise(2, 4000, seed=181)
+    upstream = noise(2, 4000, seed=182)
+
+    leaf = signal.clone().requires_grad_(True)
+    torch.autograd.grad(module(leaf), leaf, upstream)  # warm the tuner
+
+    leaf = signal.clone().requires_grad_(True)
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        torch.autograd.grad(module(leaf), leaf, upstream)
+        torch.cuda.synchronize()
+
+    launched = {
+        event.key for event in prof.key_averages() if event.self_device_time_total > 0
+    }
+
+    assert launched == {
+        "_state_scan_kernel",
+        "_carry_kernel",
+        "_output_scan_kernel",
+    }, launched

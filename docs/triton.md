@@ -148,17 +148,25 @@ alignment filter alone:
 
 torchaudio evaluates the order-10 Butterworth bandpass as a direct-form-I
 recursion, which is badly conditioned; the Triton kernel evaluates it as a
-chunked scan in a modal state basis. End to end this makes the Triton backend
+chunked scan in a better conditioned state-space realisation, selected as
+described below. End to end this makes the Triton backend
 roughly **17x closer to the float64 result** than the PyTorch backend on both
 distances. In other words, most of the disagreement between the two backends is
 the reference being wrong, not the kernels.
 
 Two places needed explicit numerical care:
 
-* **The modal state basis** (see above). The companion matrix of the order-10
-  filter is strongly non-normal — `max|A^t|` reaches 1.1e4 — so the float32
-  tables of a naive chunked scan overflow. Diagonalising into rotation-scaling
-  blocks keeps every table `O(10)`.
+* **The state-space realisation.** The companion matrix of the order-10 filter
+  is strongly non-normal — `max|A^t|` reaches 1.1e4 — so the float32 tables of a
+  naive chunked scan overflow. Three realisations of the same filter are built
+  on the host (companion, a real modal form, and a biquad cascade) and scored on
+  the peak relative error each is predicted to produce. The score adds two terms
+  that must both be counted: how far the realisation's *float64* impulse
+  response already deviates from the true one, and the largest table entry it
+  asks the kernels to handle times the float32 unit round off. Scoring only the
+  second picks a well-conditioned realisation that is quietly wrong. For both
+  PESQ filters the cascade wins; a filter whose best realisation would still
+  lose every significant digit is rejected rather than silently returning NaN.
 * **The loudness curve near the hearing threshold.** Evaluating
   `(0.5 + 0.5 x/th)^e - 1` directly loses the entire mantissa as `x` approaches
   `th`, and bands sitting just above their threshold are the common case in this

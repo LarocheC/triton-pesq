@@ -38,8 +38,8 @@ order 10 bandpass used by PESQ ``max|A^t|`` reaches ``2.2e3`` and ``A^64``
 reaches ``1.1e4``, which makes the float32 tables above useless -- the
 recursion overflows to ``inf`` within a few hundred chunks.  The state is
 therefore expressed in a better conditioned basis.  Three realisations are
-built on the host, each is validated against the difference equation and the
-one with the smallest table entries wins:
+built on the host and the one with the smallest *predicted peak relative
+error* wins, see :func:`_score`:
 
 ``companion``
     the plain direct form II transposed state, only competitive for biquads;
@@ -53,22 +53,40 @@ one with the smallest table entries wins:
 
 All three are similarity-like reformulations of the same recursion, so the
 three kernels are byte identical -- only the constant tables differ.  For the
-order 10 PESQ bandpass the largest table entry is ``3.0e4`` (companion),
-``4.5e1`` (modal) and ``6.9e0`` (cascade), so the cascade is selected.  A
-filter whose best realisation still needs entries beyond
-:data:`_FLOAT32_LIMIT` is rejected with an error instead of silently returning
-``NaN``.
+order 10 PESQ bandpass the predicted error is ``1.8e-3`` (companion),
+``2.7e-06`` (modal) and ``4.1e-07`` (cascade), so the cascade is selected.  A
+filter for which even the best realisation would lose every significant
+float32 digit is rejected with an error instead of silently returning ``NaN``;
+one that merely degrades emits a :class:`RuntimeWarning` quoting the expected
+error.
 
 The resulting filter is far *more* accurate than the oracle it replaces.
-Measured against a float64 :func:`~torchaudio.functional.lfilter` on 8x16000
+Measured against a float64 :func:`~torchaudio.functional.lfilter` on 2x16000
 samples of white noise, peak relative error of the order 10 bandpass:
 
 ===================  ==========  ==============
 pass                 this module  float32 oracle
 ===================  ==========  ==============
-forward                 2.5e-07        8.5e-03
-backward                2.3e-07        1.5e-02
+forward                 2.2e-07        8.5e-03
+backward                2.9e-07        1.5e-02
 ===================  ==========  ==============
+
+Limitations
+-----------
+The error above is a peak *relative to the peak of the output*, and it is
+reached for any input scale that keeps the internal state in the float32
+normal range.  Two regimes leave it:
+
+* inputs at the float32 denormal floor (peak magnitude below ``1e-37``).  The
+  state of the cascade is scaled by the per section gains, so it underflows
+  before the signal does and the relative error grows to ``6e-06`` at ``1e-38``
+  and to order one below ``1e-42``.  Scale such signals up, the filter is
+  exactly linear.
+* poles within ``1e-5`` of the unit circle *and* signals of several hundred
+  thousand samples, where the ``1/(1 - |p|)`` gain of the filter amplifies
+  float32 round off faster than the chunked scan can help.  Measured ``4.4e-05``
+  for a pole radius of ``0.99999`` over 480000 samples -- still 28x better than
+  the float32 oracle on the same input, which reaches ``1.2e-03``.
 
 Backward
 --------
@@ -118,6 +136,9 @@ DEFAULT_CHUNK = 256
 #: Available inner formulations, see :class:`TritonIIR`.
 METHODS = ("scan", "matmul")
 
+#: Unit round off of float32, the error the kernels add per table entry.
+_FLOAT32_EPS = 2.0**-24
+
 #: Largest table entry a realisation may need before it is rejected outright.
 #: float32 carries 7 decimal digits, so ``1e5`` still leaves two digits of the
 #: filtered signal; beyond that the recursion is pure cancellation noise and,
@@ -128,12 +149,12 @@ _FLOAT32_LIMIT = 1e5
 #: Table entry above which float32 accuracy is degraded but still usable.
 _FLOAT32_WARN = 1e3
 
-#: Peak relative deviation from the difference equation a realisation may show
-#: before it is discarded.  This is a *validity* gate, not a precision one: a
-#: broken eigendecomposition is off by 100%, while a healthy realisation of a
-#: high order resonant filter can legitimately differ from the float64 direct
-#: form by ~1e-6 simply because the direct form itself accumulates error.
-_VALID_TOL = 1e-4
+#: Predicted peak relative error above which a realisation is rejected, and
+#: above which it is merely flagged.  Both are :data:`_FLOAT32_LIMIT` and
+#: :data:`_FLOAT32_WARN` expressed in the unit the selection actually scores,
+#: see :func:`_score`.
+_ERROR_LIMIT = _FLOAT32_LIMIT * _FLOAT32_EPS
+_ERROR_WARN = _FLOAT32_WARN * _FLOAT32_EPS
 
 #: Element offsets are computed in int32 inside the kernels.
 _MAX_ELEMENTS = 2**31 - 1
@@ -413,13 +434,52 @@ def _condition(state: np.ndarray, read: np.ndarray, taps: int) -> float:
     return float(current)
 
 
-def _state_space(b: np.ndarray, a: np.ndarray, taps: int):
-    """Well conditioned state space realisation of a difference equation.
+def _score(state, drive, read, feed, reference, scale, taps):
+    """Peak relative error a realisation is expected to produce.
 
-    The companion, the modal and the cascaded realisation are built, each is
-    validated against :func:`_direct_response` and the best conditioned of the
-    survivors is returned.  Conditioning is measured as the largest table entry
-    any kernel would have to handle.
+    Two independent error sources add up, and both have to be scored or the
+    selection picks a realisation that is well conditioned but wrong:
+
+    ``fidelity``
+        the tables are built from the powers :math:`A^t`, so a realisation
+        whose transition matrix is ill conditioned already misses the true
+        impulse response *in float64*.  That error is baked into the constants
+        and no amount of runtime precision recovers it.
+    ``conditioning``
+        the largest table entry the kernels have to handle, times the float32
+        unit round off.  A table entry of ``1e3`` next to an output of order
+        one means three digits of cancellation at runtime.
+
+    Scoring only the second one is what makes an order 16 bandpass pick the
+    modal basis (largest entry ``66``, but a float64 impulse response that is
+    already off by ``2.3e-5``) over the cascade (largest entry ``81``, impulse
+    response exact to ``8e-8``), and lose four digits for nothing.
+
+    Returns
+    -------
+    Tuple[float, float]
+        Predicted peak relative error and the largest table entry
+    """
+
+    response = _impulse_response(state, drive, read, feed, taps)
+    fidelity = float(np.abs(response - reference).max() / scale)
+
+    if not math.isfinite(fidelity):
+        return math.inf, math.inf
+
+    entry = _condition(state, read, taps)
+    if not math.isfinite(entry):  # pragma: no cover - caught by the caller
+        return math.inf, math.inf
+
+    return max(fidelity, entry * _FLOAT32_EPS), entry
+
+
+def _state_space(b: np.ndarray, a: np.ndarray, taps: int):
+    """Most accurate state space realisation of a difference equation.
+
+    The companion, the modal and the cascaded realisation are built and the one
+    with the smallest predicted peak relative error is returned, see
+    :func:`_score`.
 
     Parameters
     ----------
@@ -440,8 +500,8 @@ def _state_space(b: np.ndarray, a: np.ndarray, taps: int):
     Raises
     ------
     RuntimeError
-        When no realisation reproduces the difference equation, or when the
-        best one still needs table entries float32 cannot carry
+        When no realisation of the coefficients is expected to keep more than
+        two significant float32 digits
     """
 
     trans, beta, feed = _companion(b, a)
@@ -459,21 +519,14 @@ def _state_space(b: np.ndarray, a: np.ndarray, taps: int):
     if cascade is not None:
         candidates.append(("cascade",) + cascade)
 
-    best, score = None, np.inf
+    best, score, entry = None, math.inf, math.inf
     for name, state, drive, read, direct in candidates:
-        response = _impulse_response(state, drive, read, direct, taps)
-        error = np.abs(response - reference).max() / scale
-        if not np.isfinite(error) or error > _VALID_TOL:
-            continue
-
-        current = _condition(state, read, taps)
-        if not math.isfinite(current):  # pragma: no cover - caught by the gate
-            continue
+        current, largest = _score(state, drive, read, direct, reference, scale, taps)
 
         if current < score:
-            best, score = (name, state, drive, read, direct), current
+            best, score, entry = (name, state, drive, read, direct), current, largest
 
-    if best is None:  # pragma: no cover - needs a pathological filter
+    if best is None or not math.isfinite(score):  # pragma: no cover - pathological
         raise RuntimeError(
             "Could not build a numerically valid state space realisation for the "
             "given coefficients."
@@ -481,19 +534,21 @@ def _state_space(b: np.ndarray, a: np.ndarray, taps: int):
 
     name, state, drive, read, direct = best
 
-    if score > _FLOAT32_LIMIT:
+    if score > _ERROR_LIMIT:
         raise RuntimeError(
             f"The best state space realisation of this filter (`{name}`, order "
-            f"{state.shape[0]}) needs table entries up to {score:.3g}, which "
-            f"float32 cannot carry -- the recursion would return `inf` or "
-            f"`NaN`. Split the filter into second order sections and chain "
-            f"several `TritonIIR` modules instead."
+            f"{state.shape[0]}) is expected to reach a peak relative error of "
+            f"only {score:.3g} in float32 (largest table entry {entry:.3g}), so "
+            f"the result would carry no significant digits. Split the filter "
+            f"into second order sections and chain several `TritonIIR` modules "
+            f"instead."
         )
-    if score > _FLOAT32_WARN:
+    if score > _ERROR_WARN:
         warnings.warn(
             f"The state space realisation of this filter (`{name}`, order "
-            f"{state.shape[0]}) needs table entries up to {score:.3g}; float32 "
-            f"accuracy will be degraded by roughly that factor.",
+            f"{state.shape[0]}) has a largest table entry of {entry:.3g}; float32 "
+            f"accuracy will be degraded to a peak relative error of about "
+            f"{score:.3g}.",
             RuntimeWarning,
             stacklevel=3,
         )
@@ -591,8 +646,13 @@ if HAS_TRITON:  # pragma: no cover - depends on the installation
     ):
         """Zero state final state of every chunk, as ``S = X @ W^T``."""
 
-        pid_c = tl.program_id(0)
-        pid_b = tl.program_id(1)
+        # the batch shares the *first* grid axis with the chunk tiles: gridDim.y
+        # is capped at 65535 by CUDA, and `nbatch` is not, so a batch of 65536
+        # short signals would fail the launch outright
+        tiles = tl.cdiv(nchunk, BLOCK_C)
+        pid = tl.program_id(0)
+        pid_b = pid // tiles
+        pid_c = pid - pid_b * tiles
 
         rows = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
         valid = rows < nchunk
@@ -633,8 +693,10 @@ if HAS_TRITON:  # pragma: no cover - depends on the installation
         cannot coalesce -- that is the price of this formulation.
         """
 
-        pid_c = tl.program_id(0)
-        pid_b = tl.program_id(1)
+        tiles = tl.cdiv(nchunk, BLOCK_C)
+        pid = tl.program_id(0)
+        pid_b = pid // tiles
+        pid_c = pid - pid_b * tiles
 
         rows = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
         valid = rows < nchunk
@@ -709,11 +771,13 @@ if HAS_TRITON:  # pragma: no cover - depends on the installation
     ):
         """Chunk output ``Y = X @ H^T + S @ G^T``."""
 
-        tiles = TAPS // BLOCK_T
+        tiles: tl.constexpr = TAPS // BLOCK_T
+        blocks = tl.cdiv(nchunk, BLOCK_C) * tiles
         pid = tl.program_id(0)
-        pid_c = pid // tiles
-        pid_t = pid % tiles
-        pid_b = tl.program_id(1)
+        pid_b = pid // blocks
+        rest = pid - pid_b * blocks
+        pid_c = rest // tiles
+        pid_t = rest % tiles
 
         rows = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
         valid = rows < nchunk
@@ -765,8 +829,10 @@ if HAS_TRITON:  # pragma: no cover - depends on the installation
     ):
         """Chunk output by a sequential recursion over the ``TAPS`` steps."""
 
-        pid_c = tl.program_id(0)
-        pid_b = tl.program_id(1)
+        tiles = tl.cdiv(nchunk, BLOCK_C)
+        pid = tl.program_id(0)
+        pid_b = pid // tiles
+        pid_c = pid - pid_b * tiles
 
         rows = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
         valid = rows < nchunk
@@ -919,11 +985,16 @@ def _launch(signal: torch.Tensor, plan, reverse: bool) -> torch.Tensor:
     taps, padded = plan.taps, plan.padded
     nchunk = (ntime + taps - 1) // taps
 
-    if nbatch * ntime > _MAX_ELEMENTS:
-        # the kernels index with int32 offsets, `pid_b * ntime + n` would wrap
+    # the kernels index with int32 offsets, so both the signal offset
+    # `pid_b * ntime + n` and the state offset `(pid_b * nchunk + c) * padded`
+    # have to stay below 2**31; the second one is the larger of the two
+    # whenever the state is padded to more entries than a chunk has samples
+    largest = max(nbatch * ntime, nbatch * nchunk * padded)
+
+    if largest > _MAX_ELEMENTS:
         raise RuntimeError(
             f"The Triton IIR filter indexes with int32 offsets and cannot take "
-            f"more than {_MAX_ELEMENTS} elements at once, got {nbatch * ntime}; "
+            f"more than {_MAX_ELEMENTS} elements at once, got {largest}; "
             f"split the batch."
         )
 
@@ -935,7 +1006,7 @@ def _launch(signal: torch.Tensor, plan, reverse: bool) -> torch.Tensor:
 
         def state(config):
             kwargs, warps, stages = config
-            grid = (triton.cdiv(nchunk, kwargs["BLOCK_C"]), nbatch)
+            grid = (triton.cdiv(nchunk, kwargs["BLOCK_C"]) * nbatch,)
             _state_matmul_kernel[grid](
                 signal,
                 states,
@@ -956,7 +1027,7 @@ def _launch(signal: torch.Tensor, plan, reverse: bool) -> torch.Tensor:
 
         def state(config):
             kwargs, warps, stages = config
-            grid = (triton.cdiv(nchunk, kwargs["BLOCK_C"]), nbatch)
+            grid = (triton.cdiv(nchunk, kwargs["BLOCK_C"]) * nbatch,)
             _state_scan_kernel[grid](
                 signal,
                 states,
@@ -996,8 +1067,9 @@ def _launch(signal: torch.Tensor, plan, reverse: bool) -> torch.Tensor:
         def output(config):
             kwargs, warps, stages = config
             grid = (
-                triton.cdiv(nchunk, kwargs["BLOCK_C"]) * (taps // kwargs["BLOCK_T"]),
-                nbatch,
+                triton.cdiv(nchunk, kwargs["BLOCK_C"])
+                * (taps // kwargs["BLOCK_T"])
+                * nbatch,
             )
             _output_matmul_kernel[grid](
                 signal,
@@ -1021,7 +1093,7 @@ def _launch(signal: torch.Tensor, plan, reverse: bool) -> torch.Tensor:
 
         def output(config):
             kwargs, warps, stages = config
-            grid = (triton.cdiv(nchunk, kwargs["BLOCK_C"]), nbatch)
+            grid = (triton.cdiv(nchunk, kwargs["BLOCK_C"]) * nbatch,)
             _output_scan_kernel[grid](
                 signal,
                 out,
@@ -1198,14 +1270,18 @@ class TritonIIR(torch.nn.Module):
     -----
     The float32 accuracy of this module is much better than the one of
     ``torchaudio``'s float32 ``lfilter``: for the order 10 PESQ bandpass the
-    peak relative error against a float64 ``lfilter`` is ``2.4e-7`` here and
+    peak relative error against a float64 ``lfilter`` is ``2.2e-7`` here and
     ``8.5e-3`` there.  A parity test against the float32 oracle can therefore
     never be tighter than the error of the oracle itself, which is why the test
-    suite compares both against a float64 reference.
+    suite compares both against a float64 reference.  See the module docstring
+    for the two regimes -- denormal inputs and poles on the unit circle -- in
+    which that figure degrades.
 
-    Measured on a GTX 1080 Ti with CUDA events, median of 25 calls, order 10
-    filter, against ``torchaudio``'s CUDA fallback: ``88us`` versus ``14983us``
-    at ``[8, 16000]`` and ``158us`` versus ``62251us`` at ``[8, 64000]``.
+    Measured on an idle GTX 1080 Ti with CUDA events, median of 25 calls, order
+    10 filter, against ``torchaudio``'s CUDA fallback: ``83us`` versus
+    ``14849us`` at ``[8, 16000]`` and ``153us`` versus ``61811us`` at
+    ``[8, 64000]``.  Forward plus backward is ``387us`` at ``[8, 16000]``, of
+    which most is the autograd engine rather than the kernels.
 
     Tile sizes are benchmarked on first use and cached per shape, so results
     are bitwise reproducible within a process but a different machine or a
@@ -1216,7 +1292,9 @@ class TritonIIR(torch.nn.Module):
     benchmarking; feed the module a stable shape when that matters.
 
     Only signals with ``batch * sample <= 2**31 - 1`` are supported, the
-    kernels index with int32 offsets.
+    kernels index with int32 offsets.  The batch is *not* limited by the CUDA
+    65535 cap on ``gridDim.y``: every kernel takes both its batch row and its
+    chunk tile from the first grid axis.
     """
 
     def __init__(
