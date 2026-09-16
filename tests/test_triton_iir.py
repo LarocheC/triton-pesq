@@ -33,7 +33,7 @@ import torch
 from scipy.signal import butter, cheby1, ellip
 from torchaudio.functional import lfilter
 
-from torch_pesq.triton_ops._common import HAS_TRITON
+from torch_pesq.triton_ops._common import HAS_TRITON, next_power_of_two
 
 #: Relative to peak error the Triton filter has to stay below.  Measured worst
 #: case over both filters, both methods, chunk sizes 64/128/256/512, 18 shapes
@@ -759,6 +759,67 @@ def test_state_space_is_well_conditioned():
 
     for name in ("_carry_64", "_power_64", "_drive_64", "_impulse_64", "_state_64"):
         assert module.get_buffer(name).abs().max().item() < 1e2
+
+
+@pytest.mark.parametrize("taps", [64, 256])
+@pytest.mark.parametrize(
+    "name", list(FILTERS) + list(DEGENERATE) + ["resonant", "narrow"]
+)
+def test_conditioning_covers_every_table(name, taps):
+    """The scored table entry has to bound every table the kernels read.
+
+    ``_condition`` used to look at the read out ``G[t] = e^T A^t`` and the
+    transition powers only, and stopped one step short of ``A^L``.  The kernels
+    also multiply the input by ``W[:, k] = A^(L-1-k) beta``, and that table is
+    *not* implied by the other two: ``b_longer_than_a`` above scored ``1.0``
+    while its ``drive`` table reaches ``8.1``, so the realisation was ranked as
+    eight times better conditioned than it is.  Counting the input map costs
+    nothing, is what the realisations are actually ranked on, and leaves the
+    choice for both PESQ filters unchanged.
+
+    ``impulse`` is deliberately excluded: it is the filter's own impulse
+    response, a property of the coefficients rather than of the realisation, and
+    every realisation of one filter carries the same one.
+    """
+
+    extra = {
+        "resonant": (
+            np.array([1.0, 0.0, 0.0, 0.0, 0.0]),
+            np.poly(
+                [
+                    0.999 * np.exp(1j * 0.30),
+                    0.999 * np.exp(-1j * 0.30),
+                    0.999 * np.exp(1j * 0.31),
+                    0.999 * np.exp(-1j * 0.31),
+                ]
+            ).real,
+        ),
+        "narrow": tuple(np.asarray(c) for c in butter(3, [0.01, 0.02], btype="band")),
+    }
+    numerator, denominator = {**FILTERS, **DEGENERATE, **extra}[name]
+
+    numerator = iir_module._as_coeffs(numerator)
+    denominator = iir_module._as_coeffs(denominator)
+
+    state, drive, read, feed, _ = iir_module._state_space(numerator, denominator, taps)
+    exact = iir_module._direct_response(numerator, denominator, taps)
+    scale = max(float(np.abs(exact).max()), 1e-30)
+
+    _, entry = iir_module._score(state, drive, read, feed, exact, scale, taps)
+
+    padded = max(16, next_power_of_two(state.shape[0]))
+    tables = iir_module._tables(state, drive, read, feed, taps, padded)
+
+    # `impulse` is the filter's own impulse response, a property of the
+    # coefficients rather than of the realisation, so it is not scored
+    largest = max(
+        float(np.abs(table).max()) for key, table in tables.items() if key != "impulse"
+    )
+
+    assert entry >= largest * (1.0 - 1e-9), (
+        f"{name}: scored table entry {entry:.4g} does not cover the largest "
+        f"entry {largest:.4g} of the tables the kernels read"
+    )
 
 
 @pytest.mark.parametrize("name", list(DEGENERATE))

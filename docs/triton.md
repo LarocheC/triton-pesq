@@ -155,10 +155,31 @@ alignment filter alone:
 torchaudio evaluates the order-10 Butterworth bandpass as a direct-form-I
 recursion, which is badly conditioned; the Triton kernel evaluates it as a
 chunked scan in a better conditioned state-space realisation, selected as
-described below. End to end this makes the Triton backend
-roughly **17x closer to the float64 result** than the PyTorch backend on both
-distances. In other words, most of the disagreement between the two backends is
-the reference being wrong, not the kernels.
+described below.
+
+That error does not reach the distances undiminished — the level alignment only
+uses the filtered signal to form a sum of squares, where the random part of the
+error largely averages out — but what is left still dominates. End to end,
+over a sweep of signal types, sample rates and lengths:
+
+| | relative error of the distances vs float64 |
+|---|---|
+| `PesqLoss`, float32 | 1e-7 … 4e-3, typically ~1e-4 |
+| `PesqLossTriton`, float32 | 1e-8 … 6e-6, typically ~1e-7 |
+
+i.e. the Triton backend is **two to three orders of magnitude closer to the
+float64 result**, and the disagreement between the two backends — usually ~1e-4,
+up to a few times 1e-3 — is almost entirely the reference being wrong, not the
+kernels.
+
+The one regime where the two agree to float32 round off is a degenerate one:
+when the per frame distortion saturates the `45.0` clamp, both distances are
+pinned to the clamp and neither backend has any freedom left. A purely harmonic
+reference with additive white noise does exactly that — the noise lands in Bark
+bands where the reference is silent, the asymmetric scaling saturates and every
+frame clamps — so it is a poor signal to compare backends on. See
+`make_signals` in `tests/test_triton_loss.py`, which adds a broadband component
+for that reason.
 
 Two places needed explicit numerical care:
 
@@ -166,13 +187,19 @@ Two places needed explicit numerical care:
   is strongly non-normal — `max|A^t|` reaches 1.1e4 — so the float32 tables of a
   naive chunked scan overflow. Three realisations of the same filter are built
   on the host (companion, a real modal form, and a biquad cascade) and scored on
-  the peak relative error each is predicted to produce. The score adds two terms
-  that must both be counted: how far the realisation's *float64* impulse
-  response already deviates from the true one, and the largest table entry it
-  asks the kernels to handle times the float32 unit round off. Scoring only the
-  second picks a well-conditioned realisation that is quietly wrong. For both
-  PESQ filters the cascade wins; a filter whose best realisation would still
-  lose every significant digit is rejected rather than silently returning NaN.
+  the peak relative error each is predicted to produce. The score is the larger
+  of two terms that must both be counted: how far the realisation's *float64*
+  impulse response already deviates from the true one, and the largest table
+  entry it asks the kernels to handle times the float32 unit round off. Scoring
+  only the second picks a well-conditioned realisation that is quietly wrong.
+  For both PESQ filters the cascade wins; a filter whose best realisation would
+  still lose every significant digit is rejected rather than silently returning
+  NaN. That prediction ranks the realisations of one filter reliably, but it is
+  a per tap estimate and not an upper bound on what the filter then measures
+  over a whole signal: `TritonIIR` with coefficients of your own — a very narrow
+  band pass, poles within `1e-3` of the unit circle — can land an order of
+  magnitude above its score and still be accepted. Both PESQ filters are well
+  inside the regime where the estimate holds.
 * **The loudness curve near the hearing threshold.** Evaluating
   `(0.5 + 0.5 x/th)^e - 1` directly loses the entire mantissa as `x` approaches
   `th`, and bands sitting just above their threshold are the common case in this

@@ -5,6 +5,12 @@ import torch
 
 from torch_pesq import PesqLoss
 from torch_pesq.triton_ops import HAS_TRITON
+from torch_pesq.triton_ops.reference import (
+    ref_align_level,
+    ref_chain,
+    ref_preemphasize,
+    ref_stft_bark,
+)
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and HAS_TRITON),
@@ -14,15 +20,26 @@ pytestmark = pytest.mark.skipif(
 if HAS_TRITON and torch.cuda.is_available():
     from torch_pesq.triton_ops.loss import PesqLossTriton
 
-# The PyTorch implementation evaluates the perceptual model in float64 (the Bark
-# tables are built by scipy and never cast down), the Triton backend runs in
-# float32 throughout. Together with a different STFT round off this limits the
-# agreement to roughly single precision on the distances. The chain also
-# contains hard thresholds (silent frames, the asymmetric scaling cut at 3.0),
-# so individual band decisions can flip; the tolerances below are chosen to
-# cover that while still being tight enough to catch real errors.
+# Comparing the two *backends* can never be tight, and not because of this one:
+# `torchaudio.functional.lfilter` evaluates the order 10 level alignment filter
+# as a float32 direct-form-I recursion and is itself off by ~1e-2 relative
+# against float64, which moves the alignment gain of the PyTorch backend by
+# ~1e-4. The chain also contains hard thresholds (silent frames, the asymmetric
+# scaling cut at 3.0), so a rounding difference can flip a single band. These
+# budgets cover that; what actually pins the kernels down is
+# `test_matches_float64_reference` below, which compares against a float64
+# evaluation of the same pipeline instead of against the other backend.
 RTOL, ATOL = 2e-3, 2e-3
 GRAD_RTOL, GRAD_ATOL = 5e-3, 5e-3
+
+# Triton against a float64 evaluation of the same pipeline. Measured worst case
+# over the signals of this file is 3.1e-07 on the distances; the budget leaves
+# room for a single flipped band decision.
+F64_RTOL = 1e-4
+
+# Below this the two backends are equally right and the comparison in
+# `test_matches_float64_reference` carries no information.
+F64_FLOOR = 1e-6
 
 
 def float32_reference(model: PesqLoss) -> PesqLoss:
@@ -40,8 +57,23 @@ def float32_reference(model: PesqLoss) -> PesqLoss:
     return model
 
 
-def make_signals(batch, samples, seed=0, device="cuda"):
-    """Speech like reference and a noisy degraded version of it."""
+def make_signals(batch, samples, seed=0, device="cuda", noise=0.2, fricative=0.3):
+    """Speech like reference and a noisy degraded version of it.
+
+    The reference is a voiced harmonic stack **plus** a broadband component, and
+    the second half of that is not decoration. A purely harmonic reference has
+    no energy at all between its partials, so additive white noise lands in
+    bands where the reference is silent, the asymmetric scaling saturates at
+    ``12`` everywhere and both distances come out pinned at their ``45.0``
+    clamp: with ``fricative=0`` and ``noise=0.2``, 90% of the frames hit the
+    symmetric clamp and 100% hit the asymmetric one, and ``d_asymm`` stays
+    exactly ``45.0`` even down to ``noise=0.001``. Every differential test in
+    this file would then be comparing two constants.
+
+    With the broadband term the distances land around ``15`` and ``36``, in the
+    middle of the range the loss is actually used in, and the comparisons below
+    have something to compare.
+    """
 
     generator = torch.Generator(device=device).manual_seed(seed)
 
@@ -56,12 +88,66 @@ def make_signals(batch, samples, seed=0, device="cuda"):
             / harmonic
             * envelope
         )
+    ref = ref + fricative * envelope * torch.randn(
+        batch, samples, device=device, generator=generator
+    )
     ref = ref / ref.abs().amax(dim=1, keepdim=True)
 
-    noise = torch.randn(batch, samples, device=device, generator=generator)
-    deg = ref + 0.2 * noise
+    deg = ref + noise * torch.randn(batch, samples, device=device, generator=generator)
 
     return ref.contiguous(), deg.contiguous()
+
+
+def float64_distances(model, ref, deg):
+    """The same pipeline evaluated in float64 on the CPU, as ground truth.
+
+    Uses the stage decomposition of :mod:`torch_pesq.triton_ops.reference`,
+    which is verified to reproduce :meth:`PesqLoss.raw` bit for bit, with every
+    constant promoted to float64. Only valid at 16 kHz, where no resampling
+    happens.
+    """
+
+    assert model.source_sample_rate == 16000
+
+    ref = ref.detach().double().cpu()
+    deg = deg.detach().double().cpu()
+
+    peak = torch.max(deg.abs().amax(1, True), ref.abs().amax(1, True))
+    ref, deg = ref / peak, deg / peak
+
+    power = model.power_filter.detach().double().cpu()
+    pre = model.pre_filter.detach().double().cpu()
+
+    ref, deg = ref_align_level(ref, power), ref_align_level(deg, power)
+    ref, deg = ref_preemphasize(ref, pre), ref_preemphasize(deg, pre)
+
+    ref = torch.nn.functional.pad(ref, (0, ref.shape[1] % 256))
+    deg = torch.nn.functional.pad(deg, (0, deg.shape[1] % 256))
+
+    window = model.to_spec.window.detach().double().cpu()
+    fbank = model.fbank.fbank.detach().double().cpu()
+    correction = model.fbank.pow_dens_correction.detach().double().cpu()
+    bark = [
+        ref_stft_bark(
+            signal,
+            window,
+            fbank,
+            correction,
+            model.to_spec.n_fft,
+            model.to_spec.hop_length,
+        )
+        for signal in (ref, deg)
+    ]
+
+    return ref_chain(
+        bark[0],
+        bark[1],
+        model.loudness.threshs.detach().double().cpu(),
+        model.loudness.exp.detach().double().cpu(),
+        model.fbank.width_bark.detach().double().cpu(),
+        torch.as_tensor(model.fbank.total_width).double().cpu(),
+        0.1866055,
+    )
 
 
 @pytest.mark.parametrize(
@@ -103,6 +189,70 @@ def test_forward_matches_pytorch(batch, samples, sample_rate):
         rtol=RTOL,
         atol=ATOL,
     )
+
+
+@pytest.mark.parametrize(
+    "batch,samples,seed", [(2, 16000, 0), (2, 16000, 7), (3, 20000, 13)]
+)
+def test_signals_are_not_clamp_saturated(batch, samples, seed):
+    """The test signals have to live inside the range the loss is used in.
+
+    Both distances are clamped at ``45.0`` per frame. A reference without
+    broadband energy pushes every frame into that clamp (see
+    :func:`make_signals`), which turns every differential test in this file
+    into a comparison of two constants and hides real disagreement between the
+    backends. This guards against that happening again.
+    """
+
+    triton_loss = PesqLossTriton(1.0, sample_rate=16000).cuda()
+    ref, deg = make_signals(batch, samples, seed=seed)
+
+    d_symm, d_asymm = (d.double() for d in triton_loss.raw(ref, deg))
+
+    assert torch.all(d_symm > 1.0) and torch.all(d_symm < 42.0)
+    assert torch.all(d_asymm > 1.0) and torch.all(d_asymm < 42.0)
+
+
+@pytest.mark.parametrize(
+    "batch,samples,noise", [(2, 16000, 0.2), (2, 16000, 0.05), (3, 20000, 0.1)]
+)
+def test_matches_float64_reference(batch, samples, noise):
+    """Triton agrees with a float64 evaluation of the same pipeline.
+
+    This is the test with teeth. Comparing the two backends against each other
+    only bounds their *disagreement*, and most of that disagreement is the
+    PyTorch backend: its ``lfilter`` carries ~1e-2 relative error on the level
+    alignment filter, which is three orders of magnitude more than the Triton
+    kernels contribute. Measured against float64 the Triton distances land at
+    ~1e-7 while the PyTorch ones land at ~1e-4, so the assertion is both that
+    Triton is close to float64 in absolute terms and that it is not the worse
+    of the two.
+    """
+
+    torch_loss = PesqLoss(1.0, sample_rate=16000).cuda()
+    triton_loss = PesqLossTriton(1.0, sample_rate=16000).cuda()
+
+    ref, deg = make_signals(batch, samples, seed=batch + samples, noise=noise)
+
+    exact = float64_distances(torch_loss, ref, deg)
+    with torch.no_grad():
+        torch_out = torch_loss.raw(ref, deg)
+        triton_out = triton_loss.raw(ref, deg)
+
+    for name, want, other, got in zip(
+        ("d_symm", "d_asymm"), exact, torch_out, triton_out
+    ):
+        want = want.double()
+        scale = want.abs().clamp(min=1e-12)
+
+        triton_err = ((got.double().cpu() - want).abs() / scale).max().item()
+        torch_err = ((other.double().cpu() - want).abs() / scale).max().item()
+
+        assert triton_err < F64_RTOL, f"{name}: {triton_err:.3e} against float64"
+        assert triton_err <= max(torch_err, F64_FLOOR), (
+            f"{name}: Triton is further from float64 ({triton_err:.3e}) than the "
+            f"PyTorch backend ({torch_err:.3e})"
+        )
 
 
 @pytest.mark.parametrize("batch,samples", [(1, 16000), (4, 24000)])

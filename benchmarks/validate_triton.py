@@ -7,8 +7,13 @@ Sweeps a range of degradation levels and compares the MOS estimates of
   * the ITU-T P.862 reference implementation from the ``pesq`` package,
     if it is installed.
 
-The Triton backend has to agree with the PyTorch implementation to float32
-precision. Agreement with the ITU reference is limited by the approximations of
+The two backends do *not* agree to float32 precision, and the Triton one is not
+the reason: ``torchaudio.functional.lfilter`` evaluates the level alignment
+filter as a float32 direct-form-I recursion and carries ~1e-2 relative error of
+its own. :func:`accuracy_against_float64` is therefore the comparison that
+means something -- it scores both backends against a float64 evaluation of the
+same pipeline, where the Triton one lands two to three orders of magnitude
+closer. Agreement with the ITU reference is limited by the approximations of
 the torch-pesq model itself (no time alignment, IIR level alignment) and is only
 reported for context.
 

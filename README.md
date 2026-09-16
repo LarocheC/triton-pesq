@@ -13,7 +13,8 @@ Implementation of the widely used Perceptual Evaluation of Speech Quality (PESQ)
 `PesqLoss` is the original PyTorch implementation, unchanged. `PesqLossTriton`
 is a drop-in replacement whose every stage, forward and backward, is a Triton
 kernel — 60x faster in the forward pass and up to 181x for forward and backward
-together, while agreeing with the original to ~1e-6.
+together, and closer to a float64 evaluation of the same pipeline than the
+original is.
 
 ## Installation
 
@@ -81,10 +82,28 @@ step = pesq.graphed(reference, degraded)   # fixes the input shape
 loss = step(reference, degraded)           # bit exact with the eager call
 ```
 
-The loss agrees with the PyTorch implementation to ~1e-6 relative. It is in fact
-the *more* accurate of the two: measured against a float64 evaluation of the
-same pipeline it is ~17x closer, because torchaudio's float32 direct-form-I
-recursion is poorly conditioned for the order 10 level alignment filter.
+The two backends do not agree to float32 round off, and the Triton one is not
+the reason. Measured against a float64 evaluation of the same pipeline, over a
+sweep of signal types, sample rates and lengths:
+
+| | relative error of the distances vs float64 |
+|---|---|
+| `PesqLoss`, float32 | 1e-7 … 4e-3, typically ~1e-4 |
+| `PesqLossTriton`, float32 | 1e-8 … 6e-6, typically ~1e-7 |
+
+so the two backends differ from *each other* by whatever the first row is,
+usually ~1e-4 and up to a few times 1e-3 on signals that stress the level
+alignment. Essentially all of it is `torchaudio.functional.lfilter`: it
+evaluates the order 10 level alignment filter as a float32 direct-form-I
+recursion, which is badly conditioned and off by ~1e-2 on the filtered signal
+itself. The Triton backend is the one to trust here, by two to three orders of
+magnitude.
+
+One case *does* agree to ~1e-6, and it is worth knowing which: signals whose
+per frame distortion sits at the `45.0` clamp — heavily degraded narrowband
+speech, or any purely harmonic reference with additive noise. Both distances
+are then pinned to the clamp and the two backends cannot do anything else but
+agree.
 
 See [docs/triton.md](docs/triton.md) for the design, `benchmarks/bench_triton.py`
 for the numbers above and `benchmarks/validate_triton.py` for a comparison of
@@ -127,8 +146,10 @@ against the reference implementation. `torch_pesq/bark.py`,
 per-stage functions, used as the oracle the kernels are tested against.
 
 What this fork adds is `torch_pesq/triton_ops/`: an alternative execution
-backend written in Triton. It changes no model behaviour and is verified
-against the original to ~1e-6 on the loss.
+backend written in Triton. It changes no model behaviour, and every stage is
+verified against their code, evaluated in float64, to single precision — see
+[Triton backend](#triton-backend) for what that does and does not mean for the
+agreement between the two backends.
 
 If you use this in academic work, please cite the original authors' paper:
 

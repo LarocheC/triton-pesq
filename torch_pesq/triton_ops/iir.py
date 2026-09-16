@@ -60,6 +60,16 @@ float32 digit is rejected with an error instead of silently returning ``NaN``;
 one that merely degrades emits a :class:`RuntimeWarning` quoting the expected
 error.
 
+That prediction ranks the three realisations of one filter reliably, but it is
+not an upper bound on what the filter then measures: it is a per tap estimate
+and the chunked scan carries its state across the whole signal.  Filters whose
+own gain amplifies round off -- a very narrow band pass, poles within ``1e-3``
+of the unit circle -- can land an order of magnitude above their score and
+still be accepted, see :func:`_score`.  Both filters of the PESQ pipeline are
+comfortably inside the regime where the estimate holds (predicted ``4.1e-07``
+and ``7.1e-07``, measured ``3.4e-07`` and ``3.7e-07``); a filter of your own is
+worth validating against a float64 ``lfilter`` once.
+
 The resulting filter is far *more* accurate than the oracle it replaces.
 Measured against a float64 :func:`~torchaudio.functional.lfilter` on 2x16000
 samples of white noise, peak relative error of the order 10 bandpass:
@@ -423,22 +433,44 @@ def _modal_realisation(trans: np.ndarray, beta: np.ndarray):
     return state, drive, read
 
 
-def _condition(state: np.ndarray, read: np.ndarray, taps: int) -> float:
-    """Largest table entry the kernels would have to handle for this form."""
+def _condition(
+    state: np.ndarray, read: np.ndarray, drive: np.ndarray, taps: int
+) -> float:
+    """Largest table entry the kernels would have to handle for this form.
 
-    power, current = np.eye(state.shape[0]), 0.0
+    :func:`_tables` builds three families of constants out of the powers of the
+    transition matrix, and every one of them is multiplied by data at runtime:
+    the read out :math:`G[t] = e^T A^t` (``carry``), the transition itself
+    (``state`` and ``power``, the latter at :math:`A^L`) and the input map
+    :math:`W[:, k] = A^{L-1-k} \\beta` (``drive``).  All three have to be
+    bounded, and the input map is not implied by the other two: a realisation
+    whose state is driven hard and read back weakly has a large ``drive`` table
+    next to small powers.  ``b_longer_than_a`` of the test suite is the plain
+    case -- its ``drive`` table reaches ``8.1`` where the read out and the
+    powers stay at ``1.0``.
+    """
+
+    power, inject, current = np.eye(state.shape[0]), drive.copy(), 0.0
     for _ in range(taps):
-        current = max(current, np.abs(read @ power).max(), np.abs(power).max())
+        current = max(
+            current,
+            np.abs(read @ power).max(),
+            np.abs(power).max(),
+            np.abs(inject).max(),
+        )
         power = state @ power
+        inject = state @ inject
 
-    return float(current)
+    # the loop leaves `power` at A^L, which is the `power` table itself
+    return float(max(current, np.abs(power).max()))
 
 
 def _score(state, drive, read, feed, reference, scale, taps):
     """Peak relative error a realisation is expected to produce.
 
-    Two independent error sources add up, and both have to be scored or the
-    selection picks a realisation that is well conditioned but wrong:
+    Two independent error sources are scored and the larger of the two wins;
+    both have to be counted or the selection picks a realisation that is well
+    conditioned but wrong:
 
     ``fidelity``
         the tables are built from the powers :math:`A^t`, so a realisation
@@ -455,6 +487,17 @@ def _score(state, drive, read, feed, reference, scale, taps):
     already off by ``2.3e-5``) over the cascade (largest entry ``81``, impulse
     response exact to ``8e-8``), and lose four digits for nothing.
 
+    This is an *estimate*, not a bound.  It is a per tap figure and the chunked
+    scan carries a state across the whole signal, so a filter whose gain
+    amplifies round off -- a narrow band pass, poles close to the unit circle --
+    can measure an order of magnitude worse than the score suggests.  Over a
+    sample of 565 filters that :func:`_state_space` accepted, the measured peak
+    relative error exceeded the score for 311 of them, by up to ``134x`` (a
+    ``0.001`` to ``0.02`` band pass, predicted ``8.2e-6``, measured ``1.1e-3``).
+    Use the score to *rank* realisations of one filter, which is what it is for,
+    and validate a filter of your own against a float64
+    :func:`~scipy.signal.lfilter` before trusting the last digits of its output.
+
     Returns
     -------
     Tuple[float, float]
@@ -467,7 +510,7 @@ def _score(state, drive, read, feed, reference, scale, taps):
     if not math.isfinite(fidelity):
         return math.inf, math.inf
 
-    entry = _condition(state, read, taps)
+    entry = _condition(state, read, drive, taps)
     if not math.isfinite(entry):  # pragma: no cover - caught by the caller
         return math.inf, math.inf
 
